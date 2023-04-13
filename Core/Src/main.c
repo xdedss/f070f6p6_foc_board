@@ -195,9 +195,11 @@ int main(void)
   while (1)
   {
       readMagSsi();
-      elecAngle = -(mag_r - 0.60) * 7 * PI * 2;
+      // modify this 0.6 value based on the angle of magnetic sensor relative to the motor
+      elecAngle = -(mag_r - 0.60) * 7 * PI * 2; 
       stat0(0.5 * sinFast(elecAngle) + 0.5);
       UVW_force(0.2);
+      // UVW_120deg(0, 0);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
