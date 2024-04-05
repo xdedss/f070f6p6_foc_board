@@ -25,6 +25,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "utils.h"
+#include "string.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -34,6 +35,61 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+// modify this ELEC_ANGLE_ZERO_POINT based on the angle of magnetic sensor relative to the motor
+#define ELEC_ANGLE_ZERO_POINT 0.565
+//#define MAG_MOUNTED_ON_TOP
+
+// flags for debug code
+//#define TEST_ELEC_ANGLE_ZERO_POINT
+//#define TEST_SENDING_I2C
+
+// velocity smoothing factor (0-1)
+// closer to 0 = smoother
+#define VEL_LERP 0.1
+
+#define PID_MODE_FORCE 1
+#define PID_MODE_VELOCITY 2
+#define PID_MODE_POSITION 3
+
+// I2C def:
+// byte0 is a flag
+// byte1-4 is a float
+// flags:
+#define I2C_UPDATE_FLAG_FORCE_TARGET 1
+#define I2C_UPDATE_FLAG_VELOCITY_TARGET 2
+#define I2C_UPDATE_FLAG_POSITION_TARGET 3
+#define I2C_UPDATE_FLAG_VELOCITY_KP 4
+#define I2C_UPDATE_FLAG_VELOCITY_KI 5
+#define I2C_UPDATE_FLAG_POSITION_KP 6
+#define I2C_UPDATE_FLAG_POSITION_KI 7
+#define I2C_UPDATE_FLAG_POSITION_KD 8
+
+typedef struct {
+    float force_target;
+    float velocity_target;
+    float position_target;
+
+    float velocity_integral;
+    float velocity_integral_cap;
+    float velocity_kp;
+    float velocity_ki;
+
+    float position_integral;
+    float position_integral_cap;
+    float position_kp;
+    float position_ki;
+    float position_kd;
+
+    uint8_t pid_mode;
+
+} PIDState;
+
+typedef union {
+    float f;
+    uint8_t u4[4];
+} Converter;
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -46,8 +102,32 @@
 /* USER CODE BEGIN PV */
 
 float mag_r = 0, elecAngle = 0;
+float realAngle = 0, realAnglePrev = 0, realVel = 0;
 uint32_t t, tPrev, dt;
 float dt_f;
+
+// i2c rx data buffer
+uint8_t RxData[8] = {0};
+
+PIDState pid_state = {
+    .force_target = 0.5,
+    .velocity_target = 1.0,
+    .position_target = 0.0,
+
+    .velocity_integral = 0.0,
+    .velocity_integral_cap = 0.1,
+    .velocity_kp = 0.1,
+    .velocity_ki = 10,
+
+    .position_integral = 0.0,
+    .position_integral_cap = 0.3,
+    .position_kp = 2.0,
+    .position_ki = 0.2,
+    .position_kd = 0.02,
+
+    .pid_mode = PID_MODE_POSITION,
+};
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -58,6 +138,74 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+
+extern void HAL_I2C_ListenCpltCallback (I2C_HandleTypeDef *hi2c)
+{
+    HAL_I2C_EnableListen_IT(hi2c);
+}
+
+extern void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
+{
+    HAL_I2C_EnableListen_IT(hi2c);
+}
+
+extern void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t TransferDirection, uint16_t AddrMatchCode)
+{
+    if(TransferDirection == I2C_DIRECTION_TRANSMIT)  // if the master wants to transmit the data
+    {
+        HAL_I2C_Slave_Sequential_Receive_IT(hi2c, RxData, 5, I2C_FIRST_AND_LAST_FRAME);
+        // this triggers HAL_I2C_SlaveRxCpltCallback when completed
+    }
+    else  // master requesting the data is not supported yet
+    {
+        Error_Handler();
+    }
+}
+
+extern void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c) {
+    Converter converter;
+    uint8_t update_flag = RxData[0];
+    memcpy(&converter, &RxData[1], 4);
+    float converted = converter.f;
+    switch (update_flag) {
+        case I2C_UPDATE_FLAG_FORCE_TARGET:
+            pid_state.force_target = converted;
+            pid_state.pid_mode = PID_MODE_FORCE;
+            break;
+        case I2C_UPDATE_FLAG_VELOCITY_TARGET:
+            pid_state.velocity_target = converted;
+            pid_state.pid_mode = PID_MODE_VELOCITY;
+            break;
+        case I2C_UPDATE_FLAG_POSITION_TARGET:
+            pid_state.position_target = converted;
+            pid_state.pid_mode = PID_MODE_POSITION;
+            break;
+        case I2C_UPDATE_FLAG_VELOCITY_KP:
+            pid_state.velocity_kp = converted;
+            break;
+        case I2C_UPDATE_FLAG_VELOCITY_KI:
+            pid_state.velocity_ki = converted;
+            break;
+        case I2C_UPDATE_FLAG_POSITION_KP:
+            pid_state.position_kp = converted;
+            break;
+        case I2C_UPDATE_FLAG_POSITION_KI:
+            pid_state.position_ki = converted;
+            break;
+        case I2C_UPDATE_FLAG_POSITION_KD:
+            pid_state.position_kd = converted;
+            break;
+    }
+}
+
+void sendI2CFloat(uint8_t flag, float f, uint8_t addr) {
+    uint8_t buf[8];
+    buf[0] = flag;
+    memcpy(&buf[1], &f, 4);
+    HAL_I2C_Master_Transmit(&hi2c1, addr << 1, buf, 5, 1000);
+}
+
 
 void UVW_WritePinPwm(float u, float v, float w)
 {
@@ -86,6 +234,7 @@ void UVW_120deg(float theta, float strength)
 void UVW_force(float f) {
     // -1 ~ 1
     // clockwise = positive
+    f = clip(f, -1, 1);
     UVW_120deg(elecAngle + PI * 0.5f, f);
 }
 
@@ -180,30 +329,97 @@ int main(void)
   MX_TIM3_Init();
   MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
-  // PWM for motor
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
-  // PWM for led
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
-  stat1(0.3);
+    // PWM for motor
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
+    // PWM for led
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+    stat1(0.3);
+
+    tPrev = HAL_GetTick();
+
+    readMagSsi();
+    realAngle = mag_r * 2 * PI;
+
+#ifndef TEST_SENDING_I2C
+    HAL_I2C_EnableListen_IT(&hi2c1);
+#endif
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-      readMagSsi();
-      // modify this 0.6 value based on the angle of magnetic sensor relative to the motor
-      elecAngle = -(mag_r - 0.60) * 7 * PI * 2; 
-      stat0(0.5 * sinFast(elecAngle) + 0.5);
-      UVW_force(0.2);
-      // UVW_120deg(0, 0);
+    while (1)
+    {
+        t = HAL_GetTick();
+        dt = t - tPrev;
+        if (dt == 0)
+            continue;
+        tPrev = t;
+        dt_f = dt * 0.001;
+
+        readMagSsi();
+        // 3205 motor has 7 electrical periods per turn
+#ifdef MAG_MOUNTED_ON_TOP
+        elecANgle = (mag_r - ELEC_ANGLE_ZERO_POINT) * 7 * PI * 2;
+#else
+        elecAngle = -(mag_r - ELEC_ANGLE_ZERO_POINT) * 7 * PI * 2;
+#endif
+        realAngle = -mag_r * 2 * PI;
+        realVel = realVel * (1 - VEL_LERP) + VEL_LERP * deltaAngle(realAngle, realAnglePrev) / dt_f;
+        realAnglePrev = realAngle;
+
+        // show elecAngle with LED
+        stat0(0.5 * sinFast(elecAngle) + 0.5);
+
+#ifdef TEST_ELEC_ANGLE_ZERO_POINT
+        UVW_120deg(0, 1);
+#else
+#ifdef TEST_SENDING_I2C
+        HAL_Delay(2000);
+        // position -> 1.0
+        sendI2CFloat(I2C_UPDATE_FLAG_POSITION_TARGET, 1.0, 7);
+        HAL_Delay(2000);
+        // position -> 0.0
+        sendI2CFloat(I2C_UPDATE_FLAG_POSITION_TARGET, 0.0, 7);
+        HAL_Delay(2000);
+        // angular velocity -> 0.2
+        sendI2CFloat(I2C_UPDATE_FLAG_VELOCITY_TARGET, 0.2, 7);
+        HAL_Delay(2000);
+        // angular velocity -> -0.2
+        sendI2CFloat(I2C_UPDATE_FLAG_VELOCITY_TARGET, -0.2, 7);
+        HAL_Delay(2000);
+        // force -> 1.0
+        sendI2CFloat(I2C_UPDATE_FLAG_FORCE_TARGET, 1.0, 7);
+#else
+        // control loop
+        float diff;
+        switch (pid_state.pid_mode)
+        {
+        case PID_MODE_FORCE:
+            UVW_force(pid_state.force_target);
+            break;
+        case PID_MODE_VELOCITY:
+            // vel ---P+I---> force
+            diff = pid_state.velocity_target - realVel;
+            pid_state.velocity_integral = clip(pid_state.velocity_integral + diff * dt_f, -pid_state.velocity_integral_cap, pid_state.velocity_integral_cap);
+            UVW_force(pid_state.velocity_kp * diff + pid_state.velocity_ki * pid_state.velocity_integral);
+            break;
+        case PID_MODE_POSITION:
+            // pos ---P+I+D---> force
+            diff = deltaAngle(pid_state.position_target, realAngle);
+            pid_state.position_integral = clip(pid_state.position_integral + diff * dt_f, -pid_state.position_integral_cap, pid_state.position_integral_cap);
+            UVW_force(pid_state.position_kp * diff + pid_state.position_ki * pid_state.position_integral - pid_state.position_kd * realVel);
+            break;
+        }
+#endif  // TEST_SENDING_I2C
+#endif  // TEST_ELEC_ANGLE_ZERO_POINT
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-  }
+    }
   /* USER CODE END 3 */
 }
 
